@@ -2,11 +2,12 @@ import taichi as ti
 from vector import *
 import ray
 from time import time
-from hittable import World, Sphere
+from hittable import World, Sphere, Cube
 from camera import Camera
 from material import *
 import math
 import random
+from taichi.math import vec3
 
 
 # switch to cpu if needed
@@ -28,11 +29,17 @@ if __name__ == '__main__':
     image_height = int(image_width / aspect_ratio)
     rays = ray.Rays(image_width, image_height)
     pixels = ti.Vector.field(3, dtype=float)
+    final_pixels = ti.Vector.field(3, dtype=float)
+    attenuation_temp = ti.Vector.field(3, dtype=float)
+    dir_temp = ti.Vector.field(3, dtype=float)
     sample_count = ti.field(dtype=ti.i32)
     needs_sample = ti.field(dtype=ti.i32)
     ti.root.dense(ti.ij,
-                  (image_width, image_height)).place(pixels, sample_count,
-                                                     needs_sample)
+                  (image_width, image_height)).place(
+                    pixels, sample_count,
+                    needs_sample, final_pixels,
+                    attenuation_temp, dir_temp
+                )
 
     samples_per_pixel = 512
     max_depth = 16
@@ -74,7 +81,7 @@ if __name__ == '__main__':
 
     world.add(Sphere([0.0, 1.0, 0.0], 1.0, mat1))
     world.add(Sphere([-4.0, 1.0, 0.0], 1.0, mat2))
-    world.add(Sphere([4.0, 1.0, 0.0], 1.0, mat3))
+    world.add(Cube([4.0, 1.0, 0.0], 1.0, mat3))
     world.commit()
 
     # camera
@@ -88,10 +95,22 @@ if __name__ == '__main__':
     start_attenuation = Vector(1.0, 1.0, 1.0)
     initial = True
 
+    max_depth = 50
+
     @ti.kernel
-    def finish():
+    def render_complete():
         for x, y in pixels:
-            pixels[x, y] = ti.sqrt(pixels[x, y] / samples_per_pixel)
+            pdf = attenuation_temp[x, y]
+            ray_dir = dir_temp[x, y]
+            pixels[x, y] += pdf * ray_dir
+
+    @ti.kernel
+    def finish(cnt: int):
+        for x, y in pixels:
+            pdf = attenuation_temp[x, y]
+            ray_dir = dir_temp[x, y]
+            pixels[x, y] += pdf * ray_dir
+            final_pixels[x, y] = ti.sqrt(pixels[x, y] / cnt)
 
     @ti.kernel
     def wavefront_initial():
@@ -100,7 +119,7 @@ if __name__ == '__main__':
             needs_sample[x, y] = 1
 
     @ti.kernel
-    def wavefront_big() -> ti.i32:
+    def render():
         ''' Loops over pixels
             for each pixel:
                 generate ray if needed
@@ -108,57 +127,55 @@ if __name__ == '__main__':
                 if miss or last bounce sample backgound
             return pixels that hit max samples
         '''
-        num_completed = 0
+        # num_completed = 0
         for x, y in pixels:
-            if sample_count[x, y] == samples_per_pixel:
-                continue
+            # if sample_count[x, y] == samples_per_pixel:
+            #     continue
 
             # gen sample
             ray_org = Point(0.0, 0.0, 0.0)
             ray_dir = Vector(0.0, 0.0, 0.0)
-            depth = max_depth
+            # depth = max_depth
             pdf = start_attenuation
 
-            if needs_sample[x, y] == 1:
-                needs_sample[x, y] = 0
-                u = (x + ti.random()) / (image_width - 1)
-                v = (y + ti.random()) / (image_height - 1)
-                ray_org, ray_dir = cam.get_ray(u, v)
-                rays.set(x, y, ray_org, ray_dir, depth, pdf)
-            else:
-                ray_org, ray_dir, depth, pdf = rays.get(x, y)
+            u = (x + ti.random()) / (image_width - 1)
+            v = (y + ti.random()) / (image_height - 1)
+            ray_org, ray_dir = cam.get_ray(u, v)
+            # rays.set(x, y, ray_org, ray_dir, depth, pdf)
 
-            # intersect
-            hit, p, n, front_facing, index = world.hit_all(ray_org, ray_dir)
-            depth -= 1
-            rays.depth[x, y] = depth
-            if hit:
-                reflected, out_origin, out_direction, attenuation = world.materials.scatter(
-                    index, ray_dir, p, n, front_facing)
-                rays.set(x, y, out_origin, out_direction, depth,
-                         pdf * attenuation)
-                ray_dir = out_direction
+            d = 0
+            while True:
+                d += 1
+                # intersect
+                hit, p, n, front_facing, index = world.hit_all(ray_org, ray_dir)
+                if hit:
+                    reflected, out_origin, out_direction, attenuation = world.materials.scatter(
+                        index, ray_dir, p, n, front_facing)
+                    if reflected:
+                        pdf *= attenuation
+                    else:
+                        attenuation_temp[x, y] = vec3(0.0)
+                        break
 
-            if not hit or depth == 0:
-                pixels[x, y] += pdf * get_background(ray_dir)
-                sample_count[x, y] += 1
-                needs_sample[x, y] = 1
+                    ray_org = out_origin
+                    ray_dir = out_direction
+                    
+                if not hit or d == max_depth:
+                    attenuation_temp[x, y] = pdf
+                    dir_temp[x, y] = get_background(ray_dir)
+                    # pixels[x, y] += pdf * get_background(ray_dir)
+                    break
 
-                if sample_count[x, y] == samples_per_pixel:
-                    num_completed += 1
+    window = ti.ui.Window("Taichi RayTracer", (image_width, image_height), vsync=False)
+    canvas = window.get_canvas()
+    gui = window.get_gui()
+    d = 0
+    while window.running:
+        d += 1
+        # wavefront_initial()
+        render()
+        # render_complete()
+        finish(d)
+        canvas.set_image(final_pixels)
+        window.show()
 
-        return num_completed
-
-    num_pixels = image_width * image_height
-
-    t = time()
-    print('starting big wavefront')
-    wavefront_initial()
-    num_completed = 0
-    while num_completed < num_pixels:
-        num_completed += wavefront_big()
-        # print('completed', num_completed)
-
-    finish()
-    print(time() - t)
-    ti.imwrite(pixels.to_numpy(), 'out.png')

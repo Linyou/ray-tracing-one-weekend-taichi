@@ -26,6 +26,11 @@ class _material:
     def scatter(self, in_direction, p, n):
         pass
 
+@ti.func
+def near_zero(v):
+    s = 1e-8
+    v_abs = ti.abs(v)
+    return (v_abs[0] < s) and (v_abs[1] < s) and (v_abs[2] < s)
 
 class Lambert(_material):
     def __init__(self, color):
@@ -37,7 +42,9 @@ class Lambert(_material):
     @staticmethod
     @ti.func
     def scatter(in_direction, p, n, color):
-        out_direction = n + random_in_hemisphere(n)
+        out_direction = n + random_in_unit_sphere()
+        if near_zero(out_direction):
+            out_direction = n
         attenuation = color
         return True, p, out_direction, attenuation
 
